@@ -23,7 +23,7 @@ use std::time::Duration;
 use gtk::prelude::*;
 use gtk::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, DrawingArea, Label,
-    Overlay, Orientation, glib,
+    Overlay, Orientation, glib, pango,
 };
 
 const PAD: f64 = 26.0;
@@ -34,6 +34,27 @@ const FOOTER: f64 = 44.0;
 const ENTRANCE: f64 = 1.4;
 /// Blob drift repaint interval.
 const DRIP: f64 = 1.0 / 24.0;
+/// Legend font stack. Used for BOTH the CSS and the Pango metrics query, so the sizes
+/// we fit against are the sizes that actually render.
+fn legend_fonts() -> String {
+    std::env::var("KEYSCAPE_FONTS").unwrap_or_else(|_| {
+        "'Cantarell', 'Noto Sans', 'DejaVu Sans', sans-serif".to_string()
+    })
+}
+
+/// Inset of the corner legends from the cap edge.
+pub const LEG_PAD: f64 = 3.0;
+/// Pango units per CSS pixel: 1px = 0.75pt at 96dpi, and Pango counts 1024 units per pt.
+const PANGO_PER_PX: f64 = 768.0;
+
+/// How far to lift a centred legend, in em, so it reads as optically centred.
+///
+/// Centring on the ascent/descent box reserves ~0.29em below the baseline for
+/// descenders, which pushes the visible mass of a letter that low. Measured on
+/// Cantarell/Noto Sans (ascent 1.069em, descent 0.293em, cap height 0.714em) the glyph
+/// centre lands 0.324em below the box centre; 0.30em matches that without over-lifting
+/// the lowercase-heavy and descender keys.
+pub const OPTICAL_RISE: f64 = 0.30;
 
 fn now() -> f64 {
     glib::monotonic_time() as f64 / 1_000_000.0
@@ -65,6 +86,8 @@ struct Ui {
     swatches: Vec<Button>,
     animating: Cell<bool>,
     unit: Cell<f64>,
+    /// Per-cap (base px, small px) legend sizes, fitted to the cap's real line boxes.
+    sizes: RefCell<Vec<(f64, f64)>>,
 }
 
 fn theme_of(ui: &Ui) -> &'static theme::Theme {
@@ -81,10 +104,22 @@ fn hex(c: [f64; 3]) -> String {
     )
 }
 
-fn stylesheet(t: &theme::Theme, unit: f64) -> String {
-    let base = (unit * 0.40).round().max(9.0);
-    let small = (unit * 0.235).round().max(7.0);
-    let modif = (unit * 0.22).round().max(8.0);
+fn stylesheet(t: &theme::Theme, unit: f64, sizes: &[(f64, f64)]) -> String {
+    // One size rule per cap: the legend box has to fit three line boxes inside one cap,
+    // and that budget differs per script, so it cannot be a single global size.
+    let mut per_cap = String::new();
+    for (i, (base_px, small_px)) in sizes.iter().enumerate() {
+        // A `valign: center` label rises by half its bottom margin, so double the lift.
+        let lift = (base_px * OPTICAL_RISE * 2.0).round();
+        per_cap.push_str(&format!(
+            ".b{i} {{ font-size: {}px; margin-top: {LEG_PAD}px; margin-bottom: {}px; }}
+             .s{i} {{ font-size: {}px; }}\n",
+            base_px.max(6.0).round(),
+            (LEG_PAD + lift).round(),
+            small_px.max(6.0).round(),
+        ));
+    }
+    let _ = unit;
     let mut swatches = String::new();
     for (i, s) in theme::THEMES.iter().enumerate() {
         swatches.push_str(&format!(
@@ -94,11 +129,12 @@ fn stylesheet(t: &theme::Theme, unit: f64) -> String {
         ));
     }
     format!(
-        "label {{ font-family: 'Cantarell', 'Noto Sans', 'DejaVu Sans', sans-serif; }}
-         .leg-base  {{ font-size: {base}px; font-weight: 700; color: {}; }}
-         .leg-mod   {{ font-size: {modif}px; font-weight: 500; color: {}; }}
-         .leg-shift {{ font-size: {small}px; font-weight: 600; color: {}; }}
-         .leg-altgr {{ font-size: {small}px; font-weight: 700; color: {}; }}
+        "label {{ font-family: {}; }}
+         .leg-base  {{ font-weight: 700; color: {}; }}
+         .leg-mod   {{ font-weight: 500; color: {}; }}
+         .leg-shift {{ font-weight: 600; color: {}; }}
+         .leg-altgr {{ font-weight: 700; color: {}; }}
+         {per_cap}
          .title     {{ font-size: 22px; font-weight: 700; color: {}; }}
          .subtitle  {{ font-size: 12px; font-weight: 500; color: {}; }}
          .brand     {{ font-size: 11px; font-weight: 700; color: {}; }}
@@ -107,6 +143,7 @@ fn stylesheet(t: &theme::Theme, unit: f64) -> String {
          .swatch    {{ min-width: 14px; min-height: 14px; padding: 0;
                         border-radius: 8px; border: 2px solid transparent; }}
          {swatches}",
+        legend_fonts(),
         hex(t.txt_base),
         hex(t.txt_dim),
         hex(t.txt_dim),
@@ -191,6 +228,91 @@ fn sync_text(ui: &Ui) {
     }
 }
 
+/// Line box, in px, that Pango gives a legend at `px` for the given script.
+///
+/// This is measured rather than assumed because the fallback fonts vary wildly:
+/// Cantarell reports 1.362em, DejaVu Sans 1.164em, but Noto Sans Arabic **2.112em** --
+/// so an Arabic label box alone can exceed a whole keycap. Passing the language is what
+/// makes Pango resolve the same font the label will actually use.
+fn line_px(ctx: &pango::Context, px: f64, lang: Option<&str>) -> f64 {
+    let mut desc = pango::FontDescription::from_string(&format!("{} 12px", legend_fonts()));
+    desc.set_absolute_size(px * PANGO_PER_PX);
+    let language = lang.map(pango::Language::from_string);
+    ctx.metrics(Some(&desc), language.as_ref()).height() as f64 / PANGO_PER_PX
+}
+
+/// Best-effort script tag for a legend, used only to hint font selection.
+fn script_lang(text: &str) -> Option<&'static str> {
+    for c in text.chars() {
+        let u = c as u32;
+        if matches!(u, 0x0600..=0x06FF | 0x0750..=0x077F | 0xFB50..=0xFEFF) {
+            return Some("ar");
+        }
+        if (0x0590..=0x05FF).contains(&u) {
+            return Some("he");
+        }
+        if (0x0900..=0x097F).contains(&u) {
+            return Some("hi");
+        }
+        if (0x0E00..=0x0E7F).contains(&u) {
+            return Some("th");
+        }
+        if (0x3040..=0x30FF).contains(&u) {
+            return Some("ja");
+        }
+        if matches!(u, 0x4E00..=0x9FFF) || matches!(u, 0xAC00..=0xD7AF) {
+            return Some("zh");
+        }
+        if (0x0370..=0x03FF).contains(&u) {
+            return Some("el");
+        }
+        if (0x0400..=0x04FF).contains(&u) {
+            return Some("ru");
+        }
+    }
+    None
+}
+
+/// Nominal legend sizes as a fraction of the key unit.
+pub const BASE_EM: f64 = 0.40;
+pub const CORNER_EM: f64 = 0.28;
+
+/// Fit every cap's legends inside its own cap.
+///
+/// Only a *single* legend box has to fit: the layout is diagonal, with L1 top-left and
+/// L2 bottom-right around a centred L0, so the corner boxes may overlap L0 vertically as
+/// long as their ink stays horizontally clear -- which single-character legends always
+/// are. Summing the three line boxes instead (the obvious reading) would wrongly shrink
+/// Latin from 25.6px to 19.6px to satisfy a collision that cannot happen.
+fn compute_sizes(ui: &Ui, ctx: &pango::Context) -> Vec<(f64, f64)> {
+    let unit = ui.unit.get();
+    let avail = unit - LEG_PAD * 2.0;
+    let base0 = unit * BASE_EM;
+    let small0 = unit * CORNER_EM;
+
+    let caps: Vec<Option<String>> = {
+        let st = ui.state.borrow();
+        st.info.caps.iter().map(|c| c.base.clone()).collect()
+    };
+
+    caps.iter()
+        .map(|base| {
+            let lang = base.as_deref().and_then(script_lang);
+            let kb = if line_px(ctx, base0, lang) > avail {
+                avail / line_px(ctx, base0, lang)
+            } else {
+                1.0
+            };
+            let ks = if line_px(ctx, small0, lang) > avail {
+                avail / line_px(ctx, small0, lang)
+            } else {
+                1.0
+            };
+            (base0 * kb, small0 * ks)
+        })
+        .collect()
+}
+
 /// Reposition and resize every cap overlay to match the fitted board.
 fn place_caps(ui: &Ui, m: &geometry::Metrics) {
     for (i, slot) in geometry::slots().iter().enumerate() {
@@ -219,7 +341,8 @@ fn ease(elapsed: f64, index: f64) -> f64 {
 
 /// Push current theme + key size into CSS.
 fn refresh_css(ui: &Ui) {
-    let css = stylesheet(theme_of(ui), ui.unit.get());
+    let sizes = ui.sizes.borrow().clone();
+    let css = stylesheet(theme_of(ui), ui.unit.get(), &sizes);
     if let Ok(p) = ui.css.try_borrow_mut() {
         p.load_from_data(&css);
     }
@@ -293,8 +416,8 @@ fn build_window(app: &Application, forced: Option<(String, String)>, check: bool
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Keyscape")
-        .default_width(1080)
-        .default_height(620)
+        .default_width(1280)
+        .default_height(660)
         .build();
 
     // GTK exposes the desktop "reduce animation" preference; honour it plus an override.
@@ -316,7 +439,7 @@ fn build_window(app: &Application, forced: Option<(String, String)>, check: bool
     let mut shift = Vec::new();
     let mut base = Vec::new();
     let mut altgr = Vec::new();
-    for _ in geometry::slots() {
+    for i in 0..geometry::slots().len() {
         let cap = Overlay::new();
         cap.set_halign(Align::Start);
         cap.set_valign(Align::Start);
@@ -338,8 +461,11 @@ fn build_window(app: &Application, forced: Option<(String, String)>, check: bool
             l
         };
         let ls = mk("leg-shift", Align::Start, Align::Start, 3);
+        ls.add_css_class(&format!("s{i}"));
         let lb = mk("leg-base", Align::Center, Align::Center, 0);
+        lb.add_css_class(&format!("b{i}"));
         let la = mk("leg-altgr", Align::End, Align::End, 3);
+        la.add_css_class(&format!("s{i}"));
         cap.set_child(Some(&ls));
         cap.add_overlay(&lb);
         cap.add_overlay(&la);
@@ -446,6 +572,7 @@ fn build_window(app: &Application, forced: Option<(String, String)>, check: bool
         swatches,
         animating: Cell::new(false),
         unit: Cell::new(0.0),
+        sizes: RefCell::new(Vec::new()),
     });
 
     for b in ui.swatches.iter() {
@@ -466,6 +593,7 @@ fn build_window(app: &Application, forced: Option<(String, String)>, check: bool
 
             if (m.unit - ui.unit.get()).abs() > 0.5 {
                 ui.unit.set(m.unit);
+                *ui.sizes.borrow_mut() = compute_sizes(&ui, &a.pango_context());
                 refresh_css(&ui);
                 place_caps(&ui, &m);
             }
@@ -492,16 +620,17 @@ fn build_window(app: &Application, forced: Option<(String, String)>, check: bool
 
     window.set_child(Some(&overlay));
     window.style_context().add_provider(&ui.css.borrow().clone(), 1000);
-    window.set_default_size(1080, 620);
+    window.set_default_size(1280, 660);
     window.set_size_request(680, 460);
 
     sync_caps(&ui);
     sync_text(&ui);
     // Fit once up front so the first frame already has correct cap geometry.
-    place_caps(&ui, &geometry::metrics(1080.0, 620.0, PAD, GAP, HEADER, FOOTER));
-    ui.unit.set(geometry::metrics(1080.0, 620.0, PAD, GAP, HEADER, FOOTER).unit);
-    refresh_css(&ui);
+    place_caps(&ui, &geometry::metrics(1280.0, 660.0, PAD, GAP, HEADER, FOOTER));
+    ui.unit.set(geometry::metrics(1280.0, 660.0, PAD, GAP, HEADER, FOOTER).unit);
     reload(&ui);
+    *ui.sizes.borrow_mut() = compute_sizes(&ui, &area.pango_context());
+    refresh_css(&ui);
 
     // Watch for layout switches. `ibus engine` is the only signal measured to track a
     // real switch; GNOME's `input-sources current` goes stale.
@@ -549,6 +678,39 @@ fn report(ui: &Rc<Ui>) {
     println!("theme       : {}", theme_of(ui).name);
     println!("key unit    : {:.1}px", ui.unit.get());
     println!("caps        : {}", ui.caps.len());
+    let ctx = ui.area.pango_context();
+    let unit = ui.unit.get();
+    let avail = unit - LEG_PAD * 2.0;
+    for (tag, lang) in [("Latin", None), ("Arabic", Some("ar"))] {
+        let b = line_px(&ctx, unit * 0.40, lang);
+        let sm = line_px(&ctx, unit * 0.235, lang);
+        println!(
+            "metrics {tag:<7}: base line {b:5.1}px  small line {sm:5.1}px  stack {:5.1}px  avail {avail:5.1}px",
+            b + 2.0 * sm
+        );
+    }
+    // Report the tightest-fitted cap, which is the one carrying all three legends.
+    {
+        let sizes = ui.sizes.borrow();
+        let three: Vec<usize> = {
+            let st = ui.state.borrow();
+            st.info
+                .caps
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.shift.is_some() && c.altgr.is_some())
+                .map(|(i, _)| i)
+                .collect()
+        };
+        if let Some(&i) = three.first()
+            && let Some((b, sm)) = sizes.get(i)
+        {
+            println!("fitted 3-legend: base {b:.1}px  small {sm:.1}px  (cap {i})");
+        }
+        let min_b = sizes.iter().map(|(b, _)| *b).fold(f64::MAX, f64::min);
+        let min_s = sizes.iter().map(|(_, s)| *s).fold(f64::MAX, f64::min);
+        println!("smallest      : base {min_b:.1}px  small {min_s:.1}px");
+    }
     println!();
 
     let mut empty = 0usize;
@@ -611,7 +773,7 @@ fn main() {
             &file,
             theme_idx,
             forced,
-            preview::Fit { w: 1080.0, h: 620.0, pad: PAD, gap: GAP, header: HEADER, footer: FOOTER },
+            preview::Fit { w: 1280.0, h: 660.0, pad: PAD, gap: GAP, header: HEADER, footer: FOOTER },
         );
         return;
     }

@@ -11,6 +11,7 @@
 use std::fs::File;
 
 use crate::geometry;
+use crate::LEG_PAD;
 use crate::layout::{self, Cap};
 use crate::render::{self, Scene};
 use crate::theme;
@@ -59,7 +60,14 @@ pub fn to_png(path: &str, theme_idx: usize, forced: Option<(String, String)>, f:
     for (i, slot) in geometry::slots().iter().enumerate() {
         if let Some(cap) = info.caps.get(i) {
             let (x, y, cw, ch) = m.rect(slot);
+            // Clip to the cap, exactly as GTK clips a label to its allocation. Without
+            // this the preview draws ink outside the cap for scripts whose real font
+            // (Noto Sans Arabic, 2.112em line box) is not the toy font used here.
+            let _ = cr.save();
+            cr.rectangle(x, y, cw, ch);
+            cr.clip();
             legends(&cr, cap, t, x, y, cw, ch);
+            let _ = cr.restore();
         }
     }
 
@@ -129,22 +137,25 @@ fn legends(cr: &cairo::Context, cap: &Cap, t: &theme::Theme, x: f64, y: f64, w: 
         cr.select_font_face(FONT, FontSlant::Normal, FontWeight::Bold);
         cr.set_font_size(size);
         if let Ok(fe) = cr.font_extents() {
-            let baseline = y + h / 2.0 - (fe.ascent() + fe.descent()) / 2.0;
+            // Lift by OPTICAL_RISE so the glyph reads as centred rather than sitting
+            // low in the cap. See the constant in main.rs for the measurement.
+            let baseline = y + h / 2.0 - (fe.ascent() + fe.descent()) / 2.0
+                + crate::OPTICAL_RISE * size;
             centred(cr, b, size, color, x + w / 2.0, baseline);
         }
     }
     if let Some(s) = &cap.shift {
-        let size = px(h, 0.235);
-        let base_y = y + 3.0 + size * 0.92;
+        let size = px(h, crate::CORNER_EM);
+        let base_y = y + LEG_PAD + size * 0.80;
         if let Ok(a) = advance(cr, s, size) {
-            centred(cr, s, size, t.txt_dim, x + 3.0 + a / 2.0, base_y);
+            centred(cr, s, size, t.txt_dim, x + LEG_PAD + a / 2.0, base_y);
         }
     }
     if let Some(a) = &cap.altgr {
-        let size = px(h, 0.235);
-        let base_y = y + h - 3.0 - size * 0.30;
+        let size = px(h, crate::CORNER_EM);
+        let base_y = y + h - LEG_PAD - size * 0.22;
         if let Ok(w_adv) = advance(cr, a, size) {
-            centred(cr, a, size, t.accent_c, x + w - 3.0 - w_adv / 2.0, base_y);
+            centred(cr, a, size, t.accent_c, x + w - LEG_PAD - w_adv / 2.0, base_y);
         }
     }
 }
