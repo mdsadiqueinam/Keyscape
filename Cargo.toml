@@ -1,0 +1,10 @@
+[package]
+name = "Keyscape"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11" }
+# png feature so `--render` can write a PNG; unifies with gtk4's cairo-rs 0.22.
+cairo-rs = { version = "0.22", features = ["png"] }
+xkbcommon = "0.9"
